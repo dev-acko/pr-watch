@@ -149,13 +149,29 @@ When all of the following are true:
 
 If a merge attempt fails (for example the base branch moved again), it logs a warning and retries on the next poll.
 
+### Merge method
+
+Default is a **regular merge commit** (`--merge-method merge`), not squash.
+
+Use `--merge-method squash` or `--merge-method rebase` if your repo prefers those.
+
+### Merge conflicts
+
+If GitHub reports conflicts, the script **never merges** and **stops immediately** with an alert:
+
+- `mergeStateStatus` is `DIRTY`
+- `mergeable` is `CONFLICTING`
+- `update branch` or `merge` API calls return a conflict error
+
+Resolve conflicts locally, push fixes, then restart the watcher. It will not retry merge while conflicts exist.
+
 ### Stop conditions
 
 | Event | Behavior |
 |-------|----------|
 | PR merged (by you or someone else) | success notification, exit `0` |
 | Required check failed | alert popup, exit `1` |
-| Merge conflicts | alert popup, exit `1` |
+| Merge conflicts | alert popup, exit `1` — no merge attempted |
 | PR closed without merge | alert popup, exit `1` |
 | Ctrl+C / SIGTERM | notification, exit `0` |
 
@@ -185,7 +201,7 @@ usage: pr_watch.py [-h] (--url URL | --pr PR) [--repo REPO]
 | `--repo owner/repo` | current repo via `gh repo view` | Repository slug |
 | `--approvals N` | `2` | Minimum number of approvals required before merge actions |
 | `--interval SECONDS` | `60` | Time between polls |
-| `--merge-method` | `squash` | `squash`, `merge`, or `rebase` |
+| `--merge-method` | `merge` | `merge` (regular merge commit), `squash`, or `rebase` |
 | `--required-checks` | all checks | Comma-separated substrings; only matching checks must pass before merge |
 | `--stop-on-checks` | all failures | Comma-separated substrings; only matching check failures stop the watcher |
 | `--dry-run` | off | Log intended actions without updating branch or merging |
@@ -207,10 +223,10 @@ python3 pr_watch.py --url "https://github.com/my-org/my-service/pull/456"
 python3 pr_watch.py --pr 456 --repo my-org/my-service --interval 30
 ```
 
-### Regular merge commit instead of squash
+### Squash merge instead of regular merge
 
 ```bash
-python3 pr_watch.py --pr 456 --repo my-org/my-service --merge-method merge
+python3 pr_watch.py --pr 456 --repo my-org/my-service --merge-method squash
 ```
 
 ### Only gate on specific CI checks

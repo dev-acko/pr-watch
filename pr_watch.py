@@ -65,7 +65,7 @@ class WatchConfig:
     target: PrTarget
     required_approvals: int = 2
     interval_seconds: int = 60
-    merge_method: str = "squash"
+    merge_method: str = "merge"
     dry_run: bool = False
     required_check_patterns: list[str] = field(default_factory=list)
     stop_check_patterns: list[str] = field(default_factory=list)
@@ -308,6 +308,46 @@ def relevant_failures(snapshot: PollSnapshot, config: WatchConfig) -> list[str]:
     return list(snapshot.checks_failed)
 
 
+CONFLICT_ERROR_MARKERS = (
+    "merge conflict",
+    "merge conflicts",
+    "conflicting",
+    "not mergeable",
+    "can't be merged",
+    "cannot be merged",
+    "head ref is dirty",
+)
+
+
+def has_merge_conflicts(snapshot: PollSnapshot) -> bool:
+    return (
+        snapshot.mergeable_state == "DIRTY"
+        or snapshot.mergeable == "CONFLICTING"
+    )
+
+
+def is_merge_state_unknown(snapshot: PollSnapshot) -> bool:
+    return (
+        snapshot.mergeable_state == "UNKNOWN"
+        or snapshot.mergeable == "UNKNOWN"
+    )
+
+
+def is_conflict_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in CONFLICT_ERROR_MARKERS)
+
+
+def stop_for_conflicts(target_label: str) -> ExitReason:
+    msg = (
+        f"{target_label} has merge conflicts. "
+        "Resolve manually and restart the watcher."
+    )
+    notify("PR Watch — conflicts", msg, alert=True)
+    LOG.error(msg)
+    return ExitReason.CONFLICTS
+
+
 def relevant_pending(snapshot: PollSnapshot, config: WatchConfig) -> list[str]:
     if config.required_check_patterns:
         return [
@@ -319,10 +359,10 @@ def relevant_pending(snapshot: PollSnapshot, config: WatchConfig) -> list[str]:
 
 
 def should_update_branch(snapshot: PollSnapshot, config: WatchConfig) -> bool:
+    if has_merge_conflicts(snapshot) or is_merge_state_unknown(snapshot):
+        return False
     if snapshot.mergeable_state == "BEHIND":
         return True
-    if snapshot.mergeable == "CONFLICTING":
-        return False
 
     # GitHub often reports BLOCKED when the branch is out of date even if checks passed.
     ready_except_merge_state = (
@@ -340,9 +380,11 @@ def can_attempt_merge(snapshot: PollSnapshot, config: WatchConfig) -> bool:
         return False
     if snapshot.approval_count < config.required_approvals:
         return False
+    if has_merge_conflicts(snapshot) or is_merge_state_unknown(snapshot):
+        return False
     if snapshot.mergeable_state in {"BEHIND", "DIRTY", "UNKNOWN"}:
         return False
-    if snapshot.mergeable == "CONFLICTING":
+    if snapshot.mergeable not in {None, "MERGEABLE"}:
         return False
     if relevant_pending(snapshot, config):
         return False
@@ -400,14 +442,13 @@ def watch_loop(config: WatchConfig) -> ExitReason:
             LOG.error(msg)
             return ExitReason.ERROR
 
-        if snapshot.mergeable_state == "DIRTY" or snapshot.mergeable == "CONFLICTING":
-            msg = (
-                f"{config.target.label} has merge conflicts. "
-                "Resolve manually and restart the watcher."
-            )
-            notify("PR Watch — conflicts", msg, alert=True)
-            LOG.error(msg)
-            return ExitReason.CONFLICTS
+        if has_merge_conflicts(snapshot):
+            return stop_for_conflicts(config.target.label)
+
+        if is_merge_state_unknown(snapshot):
+            LOG.info("waiting for GitHub to compute mergeability")
+            time.sleep(config.interval_seconds)
+            continue
 
         failures = relevant_failures(snapshot, config)
         if failures and not relevant_pending(snapshot, config):
@@ -435,6 +476,8 @@ def watch_loop(config: WatchConfig) -> ExitReason:
                         f"{config.target.label}: update branch triggered, waiting for CI/Sonar.",
                     )
                 except RuntimeError as exc:
+                    if is_conflict_error(str(exc)):
+                        return stop_for_conflicts(config.target.label)
                     LOG.error("update-branch error: %s", exc)
             else:
                 LOG.info("update already triggered for current head; waiting for CI")
@@ -451,6 +494,8 @@ def watch_loop(config: WatchConfig) -> ExitReason:
                 LOG.info(msg)
                 return ExitReason.MERGED
             except RuntimeError as exc:
+                if is_conflict_error(str(exc)):
+                    return stop_for_conflicts(config.target.label)
                 LOG.warning("merge attempt failed, will retry: %s", exc)
         else:
             LOG.info(
@@ -489,8 +534,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--merge-method",
         choices=["merge", "squash", "rebase"],
-        default="squash",
-        help="merge strategy (default: squash)",
+        default="merge",
+        help="merge strategy (default: merge — regular merge commit)",
     )
     parser.add_argument(
         "--required-checks",

@@ -1,0 +1,19 @@
+{
+  "defaults": {
+    "approvals": 2,
+    "interval": 60,
+    "merge_method": "merge"
+  },
+  "repos": {
+    "ackotech/AckoFlutter": {
+      "description": "Flutter app — Sonar quality gates",
+      "required_checks": ["Sonar"],
+      "stop_on_checks": ["Sonar"]
+    },
+    "ackotech/auto-bff": {
+      "description": "Auto BFF — Sonar + test coverage shards",
+      "required_checks": ["Sonar", "Coverage"],
+      "stop_on_checks": ["Sonar", "Coverage"]
+    }
+  }
+}

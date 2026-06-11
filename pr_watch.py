@@ -24,6 +24,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Optional
 LOG = logging.getLogger("pr-watch")
 
@@ -279,6 +280,76 @@ def parse_target(
     return PrTarget(owner=owner, repo=repo_name, number=pr_number)
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG_PATHS = (
+    Path.home() / ".config" / "pr-watch" / "repos.json",
+    SCRIPT_DIR / "repos.json",
+)
+
+
+def load_profiles_config(explicit_path: Optional[str] = None) -> dict[str, Any]:
+    paths = [Path(explicit_path)] if explicit_path else list(DEFAULT_CONFIG_PATHS)
+    for path in paths:
+        if path.is_file():
+            with path.open(encoding="utf-8") as handle:
+                data = json.load(handle)
+            LOG.debug("loaded repo profiles from %s", path)
+            return data
+    return {"defaults": {}, "repos": {}}
+
+
+def resolve_repo_profile(
+    slug: str, config_data: dict[str, Any]
+) -> tuple[dict[str, Any], bool]:
+    defaults = config_data.get("defaults") or {}
+    repo_cfg = (config_data.get("repos") or {}).get(slug)
+    merged = {**defaults, **(repo_cfg or {})}
+    return merged, repo_cfg is not None
+
+
+def patterns_from_profile(profile: dict[str, Any], key: str) -> list[str]:
+    value = profile.get(key)
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return split_patterns(str(value))
+
+
+def pick_config_value(
+    cli_value: Any,
+    profile: dict[str, Any],
+    profile_key: str,
+    fallback: Any,
+) -> Any:
+    if cli_value is not None:
+        return cli_value
+    if profile_key in profile and profile[profile_key] is not None:
+        return profile[profile_key]
+    return fallback
+
+
+def list_profiles(config_data: dict[str, Any]) -> None:
+    defaults = config_data.get("defaults") or {}
+    repos = config_data.get("repos") or {}
+    print("Defaults:")
+    for key, value in defaults.items():
+        print(f"  {key}: {value}")
+    print("\nConfigured repos:")
+    if not repos:
+        print("  (none)")
+        return
+    for slug, profile in repos.items():
+        description = profile.get("description", "")
+        required = ", ".join(patterns_from_profile(profile, "required_checks")) or "all"
+        stop_on = ", ".join(patterns_from_profile(profile, "stop_on_checks")) or "all"
+        print(f"  {slug}")
+        if description:
+            print(f"    {description}")
+        print(f"    required_checks: {required}")
+        print(f"    stop_on_checks: {stop_on}")
+
+
 def verify_gh_auth() -> None:
     result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
     if result.returncode != 0:
@@ -513,37 +584,57 @@ def watch_loop(config: WatchConfig) -> ExitReason:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Long-running GitHub PR watcher with auto update-branch and merge.",
+        epilog=(
+            "Shortcut: pr-watch https://github.com/owner/repo/pull/123\n"
+            "Repo-specific rules are loaded from ~/.config/pr-watch/repos.json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("--url", help="GitHub PR URL")
-    target.add_argument("--pr", type=int, help="PR number (uses current repo if --repo omitted)")
+    parser.add_argument(
+        "pr_url",
+        nargs="?",
+        help="GitHub PR URL (positional shortcut)",
+    )
+    parser.add_argument("--url", help="GitHub PR URL")
+    parser.add_argument("--pr", type=int, help="PR number (uses current repo if --repo omitted)")
 
     parser.add_argument("--repo", help="owner/repo (optional with --pr in current git repo)")
     parser.add_argument(
+        "--config",
+        help="path to repos.json profile config (default: ~/.config/pr-watch/repos.json)",
+    )
+    parser.add_argument(
+        "--list-profiles",
+        action="store_true",
+        help="show configured repo profiles and exit",
+    )
+    parser.add_argument(
         "--approvals",
         type=int,
-        default=2,
-        help="required approval count (default: 2)",
+        default=None,
+        help="required approval count (overrides repo profile)",
     )
     parser.add_argument(
         "--interval",
         type=int,
-        default=60,
-        help="poll interval in seconds (default: 60)",
+        default=None,
+        help="poll interval in seconds (overrides repo profile)",
     )
     parser.add_argument(
         "--merge-method",
         choices=["merge", "squash", "rebase"],
-        default="merge",
-        help="merge strategy (default: merge — regular merge commit)",
+        default=None,
+        help="merge strategy (overrides repo profile)",
     )
     parser.add_argument(
         "--required-checks",
-        help="comma-separated substrings; only these checks gate merge (default: all)",
+        default=None,
+        help="comma-separated substrings; only these checks gate merge (overrides repo profile)",
     )
     parser.add_argument(
         "--stop-on-checks",
-        help="comma-separated substrings; only these failures stop the watcher (default: all failures)",
+        default=None,
+        help="comma-separated substrings; only these failures stop the watcher (overrides repo profile)",
     )
     parser.add_argument(
         "--dry-run",
@@ -569,22 +660,62 @@ def main(argv: Optional[list[str]] = None) -> int:
         datefmt="%H:%M:%S",
     )
 
+    profiles_config = load_profiles_config(args.config)
+    if args.list_profiles:
+        list_profiles(profiles_config)
+        return 0
+
+    pr_url = args.url or args.pr_url
+    if not pr_url and args.pr is None:
+        parser.error("provide a PR URL or --pr")
+
     try:
         verify_gh_auth()
-        target = parse_target(pr_url=args.url, pr_number=args.pr, repo=args.repo)
+        target = parse_target(pr_url=pr_url, pr_number=args.pr, repo=args.repo)
     except (RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
         LOG.error("%s", exc)
         return 1
 
+    profile, has_repo_profile = resolve_repo_profile(target.slug, profiles_config)
+    if has_repo_profile:
+        LOG.info(
+            "using repo profile for %s%s",
+            target.slug,
+            f" — {profile['description']}" if profile.get("description") else "",
+        )
+    else:
+        LOG.info("no repo profile for %s — using defaults", target.slug)
+
+    required_checks = (
+        split_patterns(args.required_checks)
+        if args.required_checks is not None
+        else patterns_from_profile(profile, "required_checks")
+    )
+    stop_on_checks = (
+        split_patterns(args.stop_on_checks)
+        if args.stop_on_checks is not None
+        else patterns_from_profile(profile, "stop_on_checks")
+    )
+
     config = WatchConfig(
         target=target,
-        required_approvals=args.approvals,
-        interval_seconds=args.interval,
-        merge_method=args.merge_method,
+        required_approvals=pick_config_value(args.approvals, profile, "approvals", 2),
+        interval_seconds=pick_config_value(args.interval, profile, "interval", 60),
+        merge_method=pick_config_value(args.merge_method, profile, "merge_method", "merge"),
         dry_run=args.dry_run,
-        required_check_patterns=split_patterns(args.required_checks),
-        stop_check_patterns=split_patterns(args.stop_on_checks),
+        required_check_patterns=required_checks,
+        stop_check_patterns=stop_on_checks,
     )
+
+    if required_checks:
+        LOG.info("required checks: %s", ", ".join(required_checks))
+    else:
+        LOG.info("required checks: all")
+
+    if stop_on_checks:
+        LOG.info("stop on checks: %s", ", ".join(stop_on_checks))
+    else:
+        LOG.info("stop on checks: all failures")
 
     WatchState.dry_run = config.dry_run
     signal.signal(signal.SIGINT, handle_signal)

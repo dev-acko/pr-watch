@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Global entrypoint for pr-watch. Run from any directory.
+set -euo pipefail
+
+resolve_script_dir() {
+  local source="$1"
+  while [ -L "${source}" ]; do
+    local dir
+    dir="$(cd "$(dirname "${source}")" && pwd)"
+    source="$(readlink "${source}")"
+    [[ "${source}" != /* ]] && source="${dir}/${source}"
+  done
+  cd "$(dirname "${source}")" && pwd
+}
+
+PR_WATCH_HOME="$(resolve_script_dir "${BASH_SOURCE[0]}")"
+
+exec python3 "${PR_WATCH_HOME}/pr_watch.py" "$@"

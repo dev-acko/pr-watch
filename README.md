@@ -51,17 +51,41 @@ gh auth refresh -s repo
 ```bash
 git clone https://github.com/dev-acko/pr-watch.git
 cd pr-watch
+./install.sh
 ```
 
-Or download `pr_watch.py` and run it directly.
+Add to `~/.zshrc` if prompted:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+This installs a global `pr-watch` command you can run from **any folder**.
+
+Or run without installing:
+
+```bash
+python3 pr_watch.py --url "https://github.com/owner/repo/pull/123"
+```
 
 ---
 
-## Quick start
+## Quick start (global command)
+
+Just pass a PR URL — repo rules are picked up automatically:
+
+```bash
+pr-watch "https://github.com/ackotech/AckoFlutter/pull/123"
+pr-watch "https://github.com/ackotech/auto-bff/pull/2524"
+```
+
+The script reads `~/.config/pr-watch/repos.json` and applies the matching profile.
 
 ### Watch by PR URL
 
 ```bash
+pr-watch "https://github.com/owner/repo/pull/123"
+# or
 python3 pr_watch.py --url "https://github.com/owner/repo/pull/123"
 ```
 
@@ -174,6 +198,56 @@ Resolve conflicts locally, push fixes, then restart the watcher. It will not ret
 | Merge conflicts | alert popup, exit `1` — no merge attempted |
 | PR closed without merge | alert popup, exit `1` |
 | Ctrl+C / SIGTERM | notification, exit `0` |
+
+---
+
+## Repo profiles (preconfigured rules)
+
+Edit `~/.config/pr-watch/repos.json` to define per-repo settings. On install, this file is created from the bundled template.
+
+```json
+{
+  "defaults": {
+    "approvals": 2,
+    "interval": 60,
+    "merge_method": "merge"
+  },
+  "repos": {
+    "ackotech/AckoFlutter": {
+      "description": "Flutter app — Sonar quality gates",
+      "required_checks": ["Sonar"],
+      "stop_on_checks": ["Sonar"]
+    },
+    "ackotech/auto-bff": {
+      "description": "Auto BFF — Sonar + test coverage shards",
+      "required_checks": ["Sonar", "Coverage"],
+      "stop_on_checks": ["Sonar", "Coverage"]
+    }
+  }
+}
+```
+
+| Profile field | Purpose |
+|---------------|---------|
+| `required_checks` | Only wait for checks whose names contain these substrings |
+| `stop_on_checks` | Only stop the watcher when these checks fail |
+| `approvals` | Override default approval count for this repo |
+| `interval` | Override poll interval for this repo |
+| `merge_method` | Override merge strategy for this repo |
+
+List configured profiles:
+
+```bash
+pr-watch --list-profiles
+```
+
+CLI flags always override profile values:
+
+```bash
+pr-watch "https://github.com/ackotech/auto-bff/pull/123" --interval 30
+```
+
+If a repo is not in the config, the script falls back to built-in defaults (2 approvals, all checks, regular merge).
 
 ---
 
@@ -393,7 +467,11 @@ Use `--stop-on-checks` to narrow which failures matter, or omit it to stop on an
 
 ### Update branch not triggering
 
-The script waits until approvals are satisfied before updating. If the PR has conflicts, resolve them manually first.
+The script waits until approvals are satisfied before updating. If the PR has conflicts, it stops with an alert — resolve them manually, push, then restart.
+
+### Script squash-merged but I wanted a regular merge
+
+The default is now `merge` (regular merge commit). Older runs used `squash` by default. Pass `--merge-method merge` explicitly if needed.
 
 ---
 

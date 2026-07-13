@@ -9,6 +9,7 @@ CONFIG_DIR="${HOME}/.config/pr-watch"
 mkdir -p "${INSTALL_BIN}" "${CONFIG_DIR}"
 
 ln -sf "${PR_WATCH_HOME}/pr-watch" "${INSTALL_BIN}/pr-watch"
+ln -sf "${PR_WATCH_HOME}/pr-watch" "${INSTALL_BIN}/prwatch"
 chmod +x "${PR_WATCH_HOME}/pr-watch" "${PR_WATCH_HOME}/pr_watch.py" "${PR_WATCH_HOME}/install.sh"
 
 if [[ ! -f "${CONFIG_DIR}/repos.json" ]]; then
@@ -30,6 +31,7 @@ esac
 echo ""
 echo "Installed. Usage from any folder:"
 echo '  pr-watch "https://github.com/ackotech/AckoFlutter/pull/123"'
+echo '  prwatch "https://github.com/ackotech/AckoFlutter/pull/123"'
 echo ""
 echo "Edit repo rules:"
 echo "  ${CONFIG_DIR}/repos.json"

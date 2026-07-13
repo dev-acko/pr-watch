@@ -17,16 +17,21 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 LOG = logging.getLogger("pr-watch")
+
+GH_BIN = os.environ.get("GH_BIN") or shutil.which("gh") or "/opt/homebrew/bin/gh"
 
 GITHUB_PR_RE = re.compile(
     r"github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
@@ -73,6 +78,25 @@ class WatchConfig:
 
 
 @dataclass
+class CliArgs:
+    pr_urls: list[str]
+    url: Optional[str]
+    pr: Optional[int]
+    repo: Optional[str]
+    config: Optional[str]
+    list_profiles: bool
+    approvals: Optional[int]
+    interval: Optional[int]
+    merge_method: Optional[str]
+    required_checks: Optional[str]
+    stop_on_checks: Optional[str]
+    chain_file: Optional[str]
+    parallel: bool
+    dry_run: bool
+    verbose: bool
+
+
+@dataclass
 class PollSnapshot:
     state: str
     mergeable: Optional[str]
@@ -86,6 +110,19 @@ class PollSnapshot:
     all_checks: list[dict[str, Any]]
 
 
+@dataclass
+class RuntimeStatus:
+    label: str
+    phase: str = "queued"
+    detail: str = "waiting to start"
+    approvals: str = "-"
+    mergeable_state: str = "-"
+    pending_count: int = 0
+    failed_count: int = 0
+    done: bool = False
+    exit_reason: str = "-"
+
+
 class GhClient:
     def __init__(self, target: PrTarget) -> None:
         self.target = target
@@ -97,7 +134,7 @@ class GhClient:
         check: bool = True,
         input_json: Optional[dict] = None,
     ) -> subprocess.CompletedProcess[str]:
-        cmd = ["gh", *args, "--repo", self.target.slug]
+        cmd = [GH_BIN, *args, "--repo", self.target.slug]
         LOG.debug("running: %s", " ".join(cmd))
         result = subprocess.run(
             cmd,
@@ -184,7 +221,71 @@ class GhClient:
 class WatchState:
     dry_run: bool = False
     shutdown_requested: bool = False
-    update_triggered_for_sha: Optional[str] = None
+    status_lock = threading.Lock()
+    statuses: dict[str, RuntimeStatus] = {}
+
+
+def set_runtime_status(
+    label: str,
+    *,
+    phase: str,
+    detail: str,
+    approvals: str = "-",
+    mergeable_state: str = "-",
+    pending_count: int = 0,
+    failed_count: int = 0,
+    done: bool = False,
+    exit_reason: str = "-",
+) -> None:
+    with WatchState.status_lock:
+        current = WatchState.statuses.get(label) or RuntimeStatus(label=label)
+        current.phase = phase
+        current.detail = detail
+        current.approvals = approvals
+        current.mergeable_state = mergeable_state
+        current.pending_count = pending_count
+        current.failed_count = failed_count
+        current.done = done
+        current.exit_reason = exit_reason
+        WatchState.statuses[label] = current
+
+
+def snapshot_statuses() -> list[RuntimeStatus]:
+    with WatchState.status_lock:
+        return [RuntimeStatus(**vars(item)) for item in WatchState.statuses.values()]
+
+
+def truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def render_parallel_dashboard() -> None:
+    statuses = sorted(snapshot_statuses(), key=lambda item: item.label)
+    if not statuses:
+        return
+
+    lines = [
+        "",
+        "PR Watch Dashboard",
+        "STATUS       PR                                  APPROVALS  MERGE      PEND  FAIL  DETAIL",
+    ]
+    for item in statuses:
+        lines.append(
+            f"{item.phase[:11]:<11}  "
+            f"{item.label[:34]:<34}  "
+            f"{item.approvals[:9]:<9}  "
+            f"{item.mergeable_state[:9]:<9}  "
+            f"{item.pending_count:>4}  "
+            f"{item.failed_count:>4}  "
+            f"{truncate(item.detail, 48)}"
+        )
+
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[2J\033[H")
+    sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
 
 
 def count_approvals(reviews: list[dict[str, Any]]) -> int:
@@ -204,13 +305,34 @@ def classify_checks(
     pending: list[str] = []
     failed: list[str] = []
     passed: list[str] = []
-    normalized: list[dict[str, Any]] = []
+    latest_by_name: dict[str, dict[str, Any]] = {}
 
     for check in rollup:
         name = check.get("name") or check.get("context") or "unknown-check"
         status = (check.get("status") or "").upper()
         conclusion = (check.get("conclusion") or "").upper()
-        normalized.append({"name": name, "status": status, "conclusion": conclusion})
+        sort_key = (
+            check.get("completedAt")
+            or check.get("startedAt")
+            or check.get("createdAt")
+            or ""
+        )
+        candidate = {
+            "name": name,
+            "status": status,
+            "conclusion": conclusion,
+            "sort_key": sort_key,
+        }
+        current = latest_by_name.get(name)
+        if current is None or candidate["sort_key"] >= current["sort_key"]:
+            latest_by_name[name] = candidate
+
+    normalized = sorted(latest_by_name.values(), key=lambda item: item["name"].lower())
+
+    for check in normalized:
+        name = check["name"]
+        status = check["status"]
+        conclusion = check["conclusion"]
 
         if status in RUNNING_STATUSES or (status != "COMPLETED" and not conclusion):
             pending.append(name)
@@ -270,7 +392,7 @@ def parse_target(
         return PrTarget(owner=owner, repo=repo_name, number=pr_number)
 
     result = subprocess.run(
-        ["gh", "repo", "view", "--json", "nameWithOwner"],
+        [GH_BIN, "repo", "view", "--json", "nameWithOwner"],
         capture_output=True,
         text=True,
         check=True,
@@ -278,6 +400,37 @@ def parse_target(
     slug = json.loads(result.stdout)["nameWithOwner"]
     owner, repo_name = slug.split("/", 1)
     return PrTarget(owner=owner, repo=repo_name, number=pr_number)
+
+
+def parse_targets(
+    *,
+    cli_urls: list[str],
+    explicit_url: Optional[str],
+    pr_number: Optional[int],
+    repo: Optional[str],
+    chain_file: Optional[str],
+) -> list[PrTarget]:
+    raw_urls: list[str] = []
+    if explicit_url:
+        raw_urls.append(explicit_url)
+    raw_urls.extend(cli_urls)
+
+    if chain_file:
+        with Path(chain_file).expanduser().open(encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                raw_urls.append(stripped)
+
+    targets: list[PrTarget] = []
+    if pr_number is not None:
+        targets.append(parse_target(pr_url=None, pr_number=pr_number, repo=repo))
+
+    for raw_url in raw_urls:
+        targets.append(parse_target(pr_url=raw_url, pr_number=None, repo=None))
+
+    return targets
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -351,10 +504,10 @@ def list_profiles(config_data: dict[str, Any]) -> None:
 
 
 def verify_gh_auth() -> None:
-    result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+    result = subprocess.run([GH_BIN, "auth", "status"], capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(
-            "gh is not authenticated. Run: gh auth login"
+            f"gh is not authenticated or unavailable at {GH_BIN}. Run: gh auth login"
         )
 
 
@@ -416,6 +569,13 @@ def stop_for_conflicts(target_label: str) -> ExitReason:
     )
     notify("PR Watch — conflicts", msg, alert=True)
     LOG.error(msg)
+    set_runtime_status(
+        target_label,
+        phase="conflicts",
+        detail="merge conflicts detected",
+        done=True,
+        exit_reason=ExitReason.CONFLICTS.value,
+    )
     return ExitReason.CONFLICTS
 
 
@@ -470,8 +630,14 @@ def can_attempt_merge(snapshot: PollSnapshot, config: WatchConfig) -> bool:
     return snapshot.mergeable_state == "CLEAN"
 
 
-def watch_loop(config: WatchConfig) -> ExitReason:
+def watch_loop(config: WatchConfig, *, dashboard_mode: bool = False) -> ExitReason:
+    update_triggered_for_sha: Optional[str] = None
     client = GhClient(config.target)
+    set_runtime_status(
+        config.target.label,
+        phase="starting",
+        detail="initializing watcher",
+    )
     LOG.info(
         "watching %s | approvals=%d | interval=%ds | merge=%s%s",
         config.target.label,
@@ -486,42 +652,83 @@ def watch_loop(config: WatchConfig) -> ExitReason:
             snapshot = client.fetch_snapshot()
         except RuntimeError as exc:
             LOG.error("poll failed: %s", exc)
+            set_runtime_status(
+                config.target.label,
+                phase="error",
+                detail=truncate(f"poll failed: {exc}", 48),
+                done=False,
+                exit_reason=ExitReason.ERROR.value,
+            )
             time.sleep(config.interval_seconds)
             continue
 
-        LOG.info(
-            "poll: state=%s mergeable=%s mergeable_state=%s approvals=%d/%d "
-            "pending=%s failed=%s",
-            snapshot.state,
-            snapshot.mergeable,
-            snapshot.mergeable_state,
-            snapshot.approval_count,
-            config.required_approvals,
-            snapshot.checks_pending or "-",
-            snapshot.checks_failed or "-",
-        )
+        if not dashboard_mode:
+            LOG.info(
+                "poll: state=%s mergeable=%s mergeable_state=%s approvals=%d/%d "
+                "pending=%s failed=%s",
+                snapshot.state,
+                snapshot.mergeable,
+                snapshot.mergeable_state,
+                snapshot.approval_count,
+                config.required_approvals,
+                snapshot.checks_pending or "-",
+                snapshot.checks_failed or "-",
+            )
 
         if snapshot.state == "MERGED":
             msg = f"{config.target.label} is already merged."
             notify("PR Watch — merged", msg)
             LOG.info(msg)
+            set_runtime_status(
+                config.target.label,
+                phase="merged",
+                detail="already merged",
+                approvals=f"{snapshot.approval_count}/{config.required_approvals}",
+                mergeable_state="MERGED",
+                pending_count=0,
+                failed_count=0,
+                done=True,
+                exit_reason=ExitReason.MERGED.value,
+            )
             return ExitReason.MERGED
 
         if snapshot.state == "CLOSED":
             msg = f"{config.target.label} was closed without merging."
             notify("PR Watch — stopped", msg, alert=True)
             LOG.error(msg)
+            set_runtime_status(
+                config.target.label,
+                phase="closed",
+                detail="closed without merge",
+                approvals=f"{snapshot.approval_count}/{config.required_approvals}",
+                mergeable_state=snapshot.mergeable_state,
+                pending_count=len(relevant_pending(snapshot, config)),
+                failed_count=len(relevant_failures(snapshot, config)),
+                done=True,
+                exit_reason=ExitReason.ERROR.value,
+            )
             return ExitReason.ERROR
 
         if has_merge_conflicts(snapshot):
             return stop_for_conflicts(config.target.label)
 
         if is_merge_state_unknown(snapshot):
-            LOG.info("waiting for GitHub to compute mergeability")
+            set_runtime_status(
+                config.target.label,
+                phase="waiting",
+                detail="waiting for GitHub mergeability",
+                approvals=f"{snapshot.approval_count}/{config.required_approvals}",
+                mergeable_state=snapshot.mergeable_state,
+                pending_count=len(relevant_pending(snapshot, config)),
+                failed_count=len(relevant_failures(snapshot, config)),
+            )
+            if not dashboard_mode:
+                LOG.info("waiting for GitHub to compute mergeability")
             time.sleep(config.interval_seconds)
             continue
 
         failures = relevant_failures(snapshot, config)
+        pending = relevant_pending(snapshot, config)
         if failures and not relevant_pending(snapshot, config):
             msg = (
                 f"{config.target.label} cannot merge. Failed checks: "
@@ -529,19 +736,49 @@ def watch_loop(config: WatchConfig) -> ExitReason:
             )
             notify("PR Watch — checks failed", msg, alert=True)
             LOG.error(msg)
+            set_runtime_status(
+                config.target.label,
+                phase="failed",
+                detail=truncate(f"failed checks: {', '.join(failures)}", 48),
+                approvals=f"{snapshot.approval_count}/{config.required_approvals}",
+                mergeable_state=snapshot.mergeable_state,
+                pending_count=len(pending),
+                failed_count=len(failures),
+                done=True,
+                exit_reason=ExitReason.CHECK_FAILED.value,
+            )
             return ExitReason.CHECK_FAILED
 
         if snapshot.approval_count < config.required_approvals:
-            LOG.info(
-                "waiting for approvals (%d/%d)",
-                snapshot.approval_count,
-                config.required_approvals,
+            set_runtime_status(
+                config.target.label,
+                phase="approvals",
+                detail="waiting for approvals",
+                approvals=f"{snapshot.approval_count}/{config.required_approvals}",
+                mergeable_state=snapshot.mergeable_state,
+                pending_count=len(pending),
+                failed_count=len(failures),
             )
+            if not dashboard_mode:
+                LOG.info(
+                    "waiting for approvals (%d/%d)",
+                    snapshot.approval_count,
+                    config.required_approvals,
+                )
         elif should_update_branch(snapshot, config):
-            if WatchState.update_triggered_for_sha != snapshot.head_sha:
+            set_runtime_status(
+                config.target.label,
+                phase="updating",
+                detail="updating branch against base",
+                approvals=f"{snapshot.approval_count}/{config.required_approvals}",
+                mergeable_state=snapshot.mergeable_state,
+                pending_count=len(pending),
+                failed_count=len(failures),
+            )
+            if update_triggered_for_sha != snapshot.head_sha:
                 try:
                     client.update_branch()
-                    WatchState.update_triggered_for_sha = snapshot.head_sha
+                    update_triggered_for_sha = snapshot.head_sha
                     notify(
                         "PR Watch — updating branch",
                         f"{config.target.label}: update branch triggered, waiting for CI/Sonar.",
@@ -551,34 +788,230 @@ def watch_loop(config: WatchConfig) -> ExitReason:
                         return stop_for_conflicts(config.target.label)
                     LOG.error("update-branch error: %s", exc)
             else:
-                LOG.info("update already triggered for current head; waiting for CI")
-        elif relevant_pending(snapshot, config):
-            LOG.info(
-                "waiting for checks: %s",
-                ", ".join(relevant_pending(snapshot, config)),
+                set_runtime_status(
+                    config.target.label,
+                    phase="checks",
+                    detail="update sent; waiting for CI",
+                    approvals=f"{snapshot.approval_count}/{config.required_approvals}",
+                    mergeable_state=snapshot.mergeable_state,
+                    pending_count=len(pending),
+                    failed_count=len(failures),
+                )
+                if not dashboard_mode:
+                    LOG.info("update already triggered for current head; waiting for CI")
+        elif pending:
+            set_runtime_status(
+                config.target.label,
+                phase="checks",
+                detail=truncate(f"waiting: {', '.join(pending)}", 48),
+                approvals=f"{snapshot.approval_count}/{config.required_approvals}",
+                mergeable_state=snapshot.mergeable_state,
+                pending_count=len(pending),
+                failed_count=len(failures),
             )
+            if not dashboard_mode:
+                LOG.info(
+                    "waiting for checks: %s",
+                    ", ".join(pending),
+                )
         elif can_attempt_merge(snapshot, config):
+            set_runtime_status(
+                config.target.label,
+                phase="merging",
+                detail=f"attempting {config.merge_method} merge",
+                approvals=f"{snapshot.approval_count}/{config.required_approvals}",
+                mergeable_state=snapshot.mergeable_state,
+                pending_count=len(pending),
+                failed_count=len(failures),
+            )
             try:
                 client.merge(config.merge_method)
                 msg = f"Successfully merged {config.target.label}."
                 notify("PR Watch — merged", msg)
                 LOG.info(msg)
+                set_runtime_status(
+                    config.target.label,
+                    phase="merged",
+                    detail=f"merged via {config.merge_method}",
+                    approvals=f"{snapshot.approval_count}/{config.required_approvals}",
+                    mergeable_state="MERGED",
+                    pending_count=0,
+                    failed_count=0,
+                    done=True,
+                    exit_reason=ExitReason.MERGED.value,
+                )
                 return ExitReason.MERGED
             except RuntimeError as exc:
                 if is_conflict_error(str(exc)):
                     return stop_for_conflicts(config.target.label)
                 LOG.warning("merge attempt failed, will retry: %s", exc)
+                set_runtime_status(
+                    config.target.label,
+                    phase="retrying",
+                    detail=truncate(f"merge retry: {exc}", 48),
+                    approvals=f"{snapshot.approval_count}/{config.required_approvals}",
+                    mergeable_state=snapshot.mergeable_state,
+                    pending_count=len(pending),
+                    failed_count=len(failures),
+                )
         else:
-            LOG.info(
-                "not ready yet (review_decision=%s, mergeable_state=%s)",
-                snapshot.review_decision,
-                snapshot.mergeable_state,
+            set_runtime_status(
+                config.target.label,
+                phase="waiting",
+                detail=truncate(
+                    f"review={snapshot.review_decision} merge={snapshot.mergeable_state}",
+                    48,
+                ),
+                approvals=f"{snapshot.approval_count}/{config.required_approvals}",
+                mergeable_state=snapshot.mergeable_state,
+                pending_count=len(pending),
+                failed_count=len(failures),
             )
+            if not dashboard_mode:
+                LOG.info(
+                    "not ready yet (review_decision=%s, mergeable_state=%s)",
+                    snapshot.review_decision,
+                    snapshot.mergeable_state,
+                )
 
         time.sleep(config.interval_seconds)
 
     notify("PR Watch — stopped", f"Stopped watching {config.target.label}.")
+    set_runtime_status(
+        config.target.label,
+        phase="stopped",
+        detail="stopped by signal",
+        done=True,
+        exit_reason=ExitReason.INTERRUPTED.value,
+    )
     return ExitReason.INTERRUPTED
+
+
+def build_watch_config(
+    target: PrTarget,
+    args: CliArgs,
+    profiles_config: dict[str, Any],
+) -> WatchConfig:
+    profile, has_repo_profile = resolve_repo_profile(target.slug, profiles_config)
+    if has_repo_profile:
+        LOG.info(
+            "using repo profile for %s%s",
+            target.slug,
+            f" — {profile['description']}" if profile.get("description") else "",
+        )
+    else:
+        LOG.info("no repo profile for %s — using defaults", target.slug)
+
+    required_checks = (
+        split_patterns(args.required_checks)
+        if args.required_checks is not None
+        else patterns_from_profile(profile, "required_checks")
+    )
+    stop_on_checks = (
+        split_patterns(args.stop_on_checks)
+        if args.stop_on_checks is not None
+        else patterns_from_profile(profile, "stop_on_checks")
+    )
+
+    config = WatchConfig(
+        target=target,
+        required_approvals=pick_config_value(args.approvals, profile, "approvals", 2),
+        interval_seconds=pick_config_value(args.interval, profile, "interval", 60),
+        merge_method=pick_config_value(args.merge_method, profile, "merge_method", "merge"),
+        dry_run=args.dry_run,
+        required_check_patterns=required_checks,
+        stop_check_patterns=stop_on_checks,
+    )
+
+    if required_checks:
+        LOG.info("[%s] required checks: %s", target.label, ", ".join(required_checks))
+    else:
+        LOG.info("[%s] required checks: all", target.label)
+
+    if stop_on_checks:
+        LOG.info("[%s] stop on checks: %s", target.label, ", ".join(stop_on_checks))
+    else:
+        LOG.info("[%s] stop on checks: all failures", target.label)
+
+    return config
+
+
+def watch_chain(configs: list[WatchConfig]) -> ExitReason:
+    total = len(configs)
+    for index, config in enumerate(configs, start=1):
+        LOG.info("starting chain item %d/%d: %s", index, total, config.target.label)
+        reason = watch_loop(config)
+        if reason not in {ExitReason.MERGED, ExitReason.INTERRUPTED}:
+            LOG.error(
+                "chain stopped at item %d/%d: %s (%s)",
+                index,
+                total,
+                config.target.label,
+                reason.value,
+            )
+            return reason
+        if reason == ExitReason.INTERRUPTED:
+            LOG.warning(
+                "chain interrupted at item %d/%d: %s",
+                index,
+                total,
+                config.target.label,
+            )
+            return reason
+
+    if total > 1:
+        notify(
+            "PR Watch — chain complete",
+            f"Finished processing {total} PRs in order.",
+        )
+    return ExitReason.MERGED
+
+
+def watch_parallel(configs: list[WatchConfig]) -> ExitReason:
+    results: dict[str, ExitReason] = {}
+    results_lock = threading.Lock()
+
+    for config in configs:
+        set_runtime_status(
+            config.target.label,
+            phase="queued",
+            detail="waiting for worker slot",
+        )
+
+    def worker(config: WatchConfig) -> None:
+        reason = watch_loop(config, dashboard_mode=True)
+        with results_lock:
+            results[config.target.label] = reason
+
+    threads = [
+        threading.Thread(target=worker, args=(config,), daemon=True)
+        for config in configs
+    ]
+    for thread in threads:
+        thread.start()
+
+    try:
+        while any(thread.is_alive() for thread in threads):
+            render_parallel_dashboard()
+            time.sleep(1)
+    finally:
+        for thread in threads:
+            thread.join()
+        render_parallel_dashboard()
+
+    reasons = list(results.values())
+    if reasons and all(reason in {ExitReason.MERGED, ExitReason.INTERRUPTED} for reason in reasons):
+        notify(
+            "PR Watch — parallel complete",
+            f"Finished processing {len(configs)} PRs in parallel.",
+        )
+        return ExitReason.MERGED
+
+    for config in configs:
+        reason = results.get(config.target.label)
+        if reason and reason not in {ExitReason.MERGED, ExitReason.INTERRUPTED}:
+            return reason
+    return ExitReason.ERROR
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -586,14 +1019,16 @@ def build_parser() -> argparse.ArgumentParser:
         description="Long-running GitHub PR watcher with auto update-branch and merge.",
         epilog=(
             "Shortcut: pr-watch https://github.com/owner/repo/pull/123\n"
+            "Chain: pr-watch <pr1> <pr2> <pr3>\n"
+            "Parallel: pr-watch --parallel <pr1> <pr2> <pr3>\n"
             "Repo-specific rules are loaded from ~/.config/pr-watch/repos.json"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "pr_url",
-        nargs="?",
-        help="GitHub PR URL (positional shortcut)",
+        "pr_urls",
+        nargs="*",
+        help="GitHub PR URL(s) as positional shortcuts; multiple values run as a chain in order",
     )
     parser.add_argument("--url", help="GitHub PR URL")
     parser.add_argument("--pr", type=int, help="PR number (uses current repo if --repo omitted)")
@@ -637,6 +1072,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma-separated substrings; only these failures stop the watcher (overrides repo profile)",
     )
     parser.add_argument(
+        "--chain-file",
+        default=None,
+        help="path to a text file containing one PR URL per line; lines starting with # are ignored",
+    )
+    parser.add_argument(
+        "--parallel",
+        action="store_true",
+        help="watch multiple PRs in parallel with a live dashboard",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="log actions without updating branch or merging",
@@ -652,7 +1097,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    parsed = parser.parse_args(argv)
+    args = CliArgs(**vars(parsed))
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -665,63 +1111,34 @@ def main(argv: Optional[list[str]] = None) -> int:
         list_profiles(profiles_config)
         return 0
 
-    pr_url = args.url or args.pr_url
-    if not pr_url and args.pr is None:
-        parser.error("provide a PR URL or --pr")
+    if not args.pr_urls and not args.url and args.pr is None and not args.chain_file:
+        parser.error("provide a PR URL, multiple PR URLs, --chain-file, or --pr")
 
     try:
         verify_gh_auth()
-        target = parse_target(pr_url=pr_url, pr_number=args.pr, repo=args.repo)
+        targets = parse_targets(
+            cli_urls=args.pr_urls,
+            explicit_url=args.url,
+            pr_number=args.pr,
+            repo=args.repo,
+            chain_file=args.chain_file,
+        )
     except (RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
         LOG.error("%s", exc)
         return 1
 
-    profile, has_repo_profile = resolve_repo_profile(target.slug, profiles_config)
-    if has_repo_profile:
-        LOG.info(
-            "using repo profile for %s%s",
-            target.slug,
-            f" — {profile['description']}" if profile.get("description") else "",
-        )
-    else:
-        LOG.info("no repo profile for %s — using defaults", target.slug)
+    if not targets:
+        parser.error("no PR targets resolved from the provided input")
 
-    required_checks = (
-        split_patterns(args.required_checks)
-        if args.required_checks is not None
-        else patterns_from_profile(profile, "required_checks")
-    )
-    stop_on_checks = (
-        split_patterns(args.stop_on_checks)
-        if args.stop_on_checks is not None
-        else patterns_from_profile(profile, "stop_on_checks")
-    )
+    configs = [build_watch_config(target, args, profiles_config) for target in targets]
 
-    config = WatchConfig(
-        target=target,
-        required_approvals=pick_config_value(args.approvals, profile, "approvals", 2),
-        interval_seconds=pick_config_value(args.interval, profile, "interval", 60),
-        merge_method=pick_config_value(args.merge_method, profile, "merge_method", "merge"),
-        dry_run=args.dry_run,
-        required_check_patterns=required_checks,
-        stop_check_patterns=stop_on_checks,
-    )
-
-    if required_checks:
-        LOG.info("required checks: %s", ", ".join(required_checks))
-    else:
-        LOG.info("required checks: all")
-
-    if stop_on_checks:
-        LOG.info("stop on checks: %s", ", ".join(stop_on_checks))
-    else:
-        LOG.info("stop on checks: all failures")
-
-    WatchState.dry_run = config.dry_run
+    WatchState.dry_run = args.dry_run
+    WatchState.shutdown_requested = False
+    WatchState.statuses = {}
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    reason = watch_loop(config)
+    reason = watch_parallel(configs) if args.parallel and len(configs) > 1 else watch_chain(configs)
     return 0 if reason in {ExitReason.MERGED, ExitReason.INTERRUPTED} else 1
 
 

@@ -1,27 +1,44 @@
 # pr-watch
 
-A local, long-running GitHub pull request watcher that polls your PR and automatically:
+A local GitHub pull request watcher that polls your PR and automatically:
 
 - waits for the required number of approvals
-- triggers **Update branch** when the PR falls behind its base branch
+- triggers **Update branch** when the PR falls behind base
 - waits for CI / quality checks to finish
-- **merges** the PR as soon as it is fully mergeable
+- merges the PR the moment GitHub allows it
 
-When a check fails (for example SonarQube) or merge conflicts appear, the script shows a macOS notification/alert and stops.
+It also supports watching multiple PRs:
 
-No cloud service, no AI, no tokens in the repo — authentication uses your local [GitHub CLI](https://cli.github.com/) session.
+- sequentially in a chain
+- in parallel with a live terminal dashboard
+
+No cloud service, no repo-stored token, no AI dependency. Authentication uses your local [GitHub CLI](https://cli.github.com/) session.
 
 ---
 
 ## Why use this?
 
-If you have ever had a PR that was:
+This is useful when a PR is:
 
-- approved and green, but blocked by **Update branch**
-- waiting on CI to rerun after an update
-- beaten to the merge by someone else while you were waiting
+- approved, but still waiting for branch update
+- green, but still waiting for a merge window
+- stuck behind CI reruns
+- one of several PRs you want to keep an eye on together
 
-…this script watches the PR for you and merges the moment GitHub allows it.
+Instead of manually refreshing GitHub, `pr-watch` keeps polling and merges as soon as the PR becomes ready.
+
+---
+
+## Features
+
+- single PR watch by URL or PR number
+- repo-aware config profiles from `~/.config/pr-watch/repos.json`
+- default merge strategy is a regular merge commit
+- sequential chain mode for ordered PR processing
+- parallel mode for watching many PRs at once
+- live terminal dashboard in parallel mode
+- macOS notifications and alerts via `osascript`
+- no third-party Python dependencies
 
 ---
 
@@ -29,11 +46,11 @@ If you have ever had a PR that was:
 
 | Requirement | Notes |
 |-------------|-------|
-| **Python 3.9+** | stdlib only — no `pip install` needed |
+| **Python 3.9+** | stdlib only |
 | **GitHub CLI (`gh`)** | [Install gh](https://cli.github.com/) |
 | **Authenticated `gh` session** | `gh auth login` |
-| **Merge permission** | your GitHub user must be allowed to merge the target PR |
-| **macOS** (optional) | desktop notifications use `osascript`; the script still works on Linux without popups |
+| **Merge permission** | your account must be allowed to merge the target PR |
+| **macOS** (optional) | desktop notifications use `osascript`; the script still works without popups on other platforms |
 
 ### GitHub token scopes
 
@@ -48,21 +65,44 @@ gh auth refresh -s repo
 
 ## Installation
 
+### Standard install
+
 ```bash
 git clone https://github.com/dev-acko/pr-watch.git
 cd pr-watch
 ./install.sh
 ```
 
-Add to `~/.zshrc` if prompted:
+This installs two terminal commands:
+
+- `pr-watch`
+- `prwatch`
+
+Both work from any folder.
+
+If `~/.local/bin` is not already on your `PATH`, add this to your shell config:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-This installs a global `pr-watch` command you can run from **any folder**.
+For `zsh`, add it to `~/.zshrc`, then reload:
 
-Or run without installing:
+```bash
+source ~/.zshrc
+```
+
+### Manual setup
+
+If you do not want to run `install.sh`, you can symlink it yourself:
+
+```bash
+mkdir -p ~/.local/bin
+ln -sf /absolute/path/to/pr-watch/pr-watch ~/.local/bin/pr-watch
+ln -sf /absolute/path/to/pr-watch/pr-watch ~/.local/bin/prwatch
+```
+
+### Run without installing
 
 ```bash
 python3 pr_watch.py --url "https://github.com/owner/repo/pull/123"
@@ -70,140 +110,198 @@ python3 pr_watch.py --url "https://github.com/owner/repo/pull/123"
 
 ---
 
-## Quick start (global command)
+## Quick start
 
-Just pass a PR URL — repo rules are picked up automatically:
+### Single PR
 
 ```bash
-pr-watch "https://github.com/ackotech/AckoFlutter/pull/123"
 pr-watch "https://github.com/ackotech/auto-bff/pull/2524"
 ```
 
-The script reads `~/.config/pr-watch/repos.json` and applies the matching profile.
+### Sequential chain
 
-### Watch by PR URL
+PRs are processed one by one, in the order you pass them:
+
+```bash
+pr-watch \
+  "https://github.com/owner/repo/pull/101" \
+  "https://github.com/owner/repo/pull/102" \
+  "https://github.com/owner/repo/pull/103"
+```
+
+### Parallel watch
+
+All PRs are watched together, and the terminal shows a live dashboard:
+
+```bash
+pr-watch --parallel \
+  "https://github.com/owner/repo/pull/101" \
+  "https://github.com/owner/repo/pull/102" \
+  "https://github.com/owner/repo/pull/103"
+```
+
+### PR list from a file
+
+```bash
+pr-watch --chain-file prs.txt
+```
+
+Example `prs.txt`:
+
+```text
+# one PR per line
+https://github.com/owner/repo/pull/101
+https://github.com/owner/repo/pull/102
+```
+
+---
+
+## How terminal setup works
+
+After installation, you can use `pr-watch` exactly like any other terminal command:
 
 ```bash
 pr-watch "https://github.com/owner/repo/pull/123"
-# or
-python3 pr_watch.py --url "https://github.com/owner/repo/pull/123"
+prwatch "https://github.com/owner/repo/pull/123"
 ```
 
-### Watch by PR number + repository
+This works because the installer places a launcher in `~/.local/bin`, which your shell reads from `PATH`.
+
+If you prefer aliases instead of a symlink-based install, you can add one to `~/.zshrc`:
 
 ```bash
-python3 pr_watch.py --pr 123 --repo owner/repo
+alias pr-watch="$HOME/path/to/pr-watch/pr-watch"
+alias prwatch="$HOME/path/to/pr-watch/pr-watch"
 ```
 
-### Watch by PR number from inside a git clone
+The symlink approach is recommended because it works from any terminal session without managing aliases manually.
 
-If you are already inside the repository directory:
+---
 
-```bash
-cd /path/to/repo
-python3 /path/to/pr_watch.py --pr 123
-```
+## Default behavior
 
-The script runs until it merges, hits a failure, or you stop it with **Ctrl+C**.
+- default polling interval: `60` seconds
+- default required approvals: `2`
+- default merge method: `merge`
+- if multiple PR URLs are passed without `--parallel`, they run sequentially
+
+That means the default merge behavior is a regular merge commit, not squash.
 
 ---
 
 ## How it works
 
-Every poll cycle (default: 60 seconds), the script fetches PR state via `gh` and decides what to do next.
+Every poll cycle, the script fetches PR state via `gh` and decides what to do next.
 
 ```text
-┌─────────────────────────────────────────┐
-│           Poll PR via gh CLI            │
-└─────────────────┬───────────────────────┘
-                  │
-     ┌────────────┼────────────┐
-     ▼            ▼            ▼
- < N approvals  Behind base   Checks running
-     │            │            │
-     │            ▼            │
-     │     Trigger update      │
-     │       branch            │
-     │            │            │
-     └────────────┴────────────┘
-                  │
-                  ▼
-         Checks failed? ──yes──► Alert + stop
-                  │
-                 no
-                  ▼
-         Conflicts? ──yes──► Alert + stop
-                  │
-                 no
-                  ▼
-    Approvals + checks green? ──yes──► Merge + stop
-                  │
-                 no
-                  ▼
-            Sleep and poll again
+poll PR
+  -> waiting for approvals
+  -> waiting for checks
+  -> update branch if behind
+  -> stop if checks fail
+  -> stop if conflicts exist
+  -> merge when fully ready
 ```
 
 ### Approval counting
 
-- Counts the **latest review per reviewer**
-- Only `APPROVED` reviews count
-- Dismissed or superseded reviews are ignored automatically
+- only the latest review per reviewer counts
+- only `APPROVED` reviews count
 
 ### Update branch
 
 Triggered when:
 
-- GitHub reports the PR as `BEHIND`, or
-- the PR is `BLOCKED` but approvals and checks are otherwise satisfied (common when only a base-branch update is missing)
+- GitHub reports `BEHIND`, or
+- GitHub reports `BLOCKED` but approvals and required checks are otherwise complete
 
-The script triggers update **once per commit SHA** to avoid spamming the API.
+The script only triggers update once per head SHA to avoid repeating the same update call.
 
-### Merge
+### Merge readiness
 
-When all of the following are true:
+The script merges only when all of these are true:
 
 - PR is `OPEN`
 - required approvals are present
-- no relevant checks are pending
-- no relevant checks have failed
-- no merge conflicts
-- GitHub merge preconditions are satisfied
+- required checks are not pending
+- required checks are not failing
+- there are no merge conflicts
+- GitHub reports the PR as mergeable
 
-…the script calls `gh pr merge`.
+### Duplicate check handling
 
-If a merge attempt fails (for example the base branch moved again), it logs a warning and retries on the next poll.
-
-### Merge method
-
-Default is a **regular merge commit** (`--merge-method merge`), not squash.
-
-Use `--merge-method squash` or `--merge-method rebase` if your repo prefers those.
-
-### Merge conflicts
-
-If GitHub reports conflicts, the script **never merges** and **stops immediately** with an alert:
-
-- `mergeStateStatus` is `DIRTY`
-- `mergeable` is `CONFLICTING`
-- `update branch` or `merge` API calls return a conflict error
-
-Resolve conflicts locally, push fixes, then restart the watcher. It will not retry merge while conflicts exist.
-
-### Stop conditions
-
-| Event | Behavior |
-|-------|----------|
-| PR merged (by you or someone else) | success notification, exit `0` |
-| Required check failed | alert popup, exit `1` |
-| Merge conflicts | alert popup, exit `1` — no merge attempted |
-| PR closed without merge | alert popup, exit `1` |
-| Ctrl+C / SIGTERM | notification, exit `0` |
+GitHub sometimes returns older and newer runs for the same check in the same rollup. `pr-watch` keeps only the latest run for each check name so stale `IN_PROGRESS` runs do not block a merge incorrectly.
 
 ---
 
-## Repo profiles (preconfigured rules)
+## Sequential chain vs parallel mode
 
-Edit `~/.config/pr-watch/repos.json` to define per-repo settings. On install, this file is created from the bundled template.
+### Sequential chain
+
+Default when you pass multiple PR URLs:
+
+```bash
+pr-watch pr1 pr2 pr3
+```
+
+Behavior:
+
+- watches `pr1`
+- merges `pr1` when ready
+- then starts `pr2`
+- then starts `pr3`
+
+Use this when order matters.
+
+### Parallel mode
+
+```bash
+pr-watch --parallel pr1 pr2 pr3
+```
+
+Behavior:
+
+- starts a watcher for every PR immediately
+- polls all of them together
+- merges each one independently as soon as it becomes ready
+
+Use this when order does not matter.
+
+### Parallel dashboard
+
+In parallel mode, the terminal shows one row per PR with:
+
+- current phase
+- PR label
+- approvals
+- merge state
+- pending check count
+- failed check count
+- short detail text
+
+Example:
+
+```text
+PR Watch Dashboard
+STATUS       PR                                  APPROVALS  MERGE      PEND  FAIL  DETAIL
+checks       ackotech/auto-bff#2722              4/2        CLEAN         2     0  waiting: Test Coverage shard 3/4...
+merging      ackotech/auto-bff#2723              4/2        CLEAN         0     0  attempting merge merge
+merged       ackotech/auto-bff#2724              4/2        MERGED        0     0  merged via merge
+```
+
+---
+
+## Repo profiles
+
+Repo-specific rules live in:
+
+```text
+~/.config/pr-watch/repos.json
+```
+
+The installer creates this file from the bundled template if it does not already exist.
+
+Example:
 
 ```json
 {
@@ -229,135 +327,139 @@ Edit `~/.config/pr-watch/repos.json` to define per-repo settings. On install, th
 
 | Profile field | Purpose |
 |---------------|---------|
-| `required_checks` | Only wait for checks whose names contain these substrings |
-| `stop_on_checks` | Only stop the watcher when these checks fail |
-| `approvals` | Override default approval count for this repo |
-| `interval` | Override poll interval for this repo |
-| `merge_method` | Override merge strategy for this repo |
+| `required_checks` | only checks containing these substrings gate merge |
+| `stop_on_checks` | only checks containing these substrings stop the watcher on failure |
+| `approvals` | required approval count for this repo |
+| `interval` | poll interval for this repo |
+| `merge_method` | merge strategy override for this repo |
 
-List configured profiles:
+Show active profiles:
 
 ```bash
 pr-watch --list-profiles
 ```
 
-CLI flags always override profile values:
-
-```bash
-pr-watch "https://github.com/ackotech/auto-bff/pull/123" --interval 30
-```
-
-If a repo is not in the config, the script falls back to built-in defaults (2 approvals, all checks, regular merge).
+CLI flags override profile values.
 
 ---
 
 ## CLI reference
 
 ```text
-usage: pr_watch.py [-h] (--url URL | --pr PR) [--repo REPO]
-                   [--approvals APPROVALS] [--interval INTERVAL]
+usage: pr_watch.py [-h] [--url URL] [--pr PR] [--repo REPO] [--config CONFIG]
+                   [--list-profiles] [--approvals APPROVALS]
+                   [--interval INTERVAL]
                    [--merge-method {merge,squash,rebase}]
                    [--required-checks REQUIRED_CHECKS]
-                   [--stop-on-checks STOP_ON_CHECKS] [--dry-run] [-v]
+                   [--stop-on-checks STOP_ON_CHECKS] [--chain-file CHAIN_FILE]
+                   [--parallel] [--dry-run] [-v]
+                   [pr_urls ...]
 ```
 
-### Target (required — pick one)
+### Target input
 
-| Flag | Description |
-|------|-------------|
-| `--url URL` | Full GitHub PR URL |
-| `--pr N` | PR number; use with `--repo` or from current git directory |
+| Input | Description |
+|-------|-------------|
+| positional `pr_urls` | one or more GitHub PR URLs |
+| `--url URL` | single GitHub PR URL |
+| `--pr N` | PR number |
+| `--repo owner/repo` | repo slug when using `--pr` outside the repo directory |
+| `--chain-file FILE` | one PR URL per line |
 
-### Optional flags
+### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--repo owner/repo` | current repo via `gh repo view` | Repository slug |
-| `--approvals N` | `2` | Minimum number of approvals required before merge actions |
-| `--interval SECONDS` | `60` | Time between polls |
-| `--merge-method` | `merge` | `merge` (regular merge commit), `squash`, or `rebase` |
-| `--required-checks` | all checks | Comma-separated substrings; only matching checks must pass before merge |
-| `--stop-on-checks` | all failures | Comma-separated substrings; only matching check failures stop the watcher |
-| `--dry-run` | off | Log intended actions without updating branch or merging |
-| `-v`, `--verbose` | off | Debug logging |
+| `--approvals N` | `2` | required approvals |
+| `--interval SECONDS` | `60` | poll interval |
+| `--merge-method` | `merge` | `merge`, `squash`, or `rebase` |
+| `--required-checks` | all checks | comma-separated substrings of checks to wait for |
+| `--stop-on-checks` | all failures | comma-separated substrings of failures that should stop the watcher |
+| `--parallel` | off | watch multiple PRs in parallel with a live dashboard |
+| `--dry-run` | off | show intended actions without updating or merging |
+| `-v`, `--verbose` | off | debug logging |
 
 ---
 
 ## Examples
 
-### Basic usage
+### Watch one PR by URL
 
 ```bash
-python3 pr_watch.py --url "https://github.com/my-org/my-service/pull/456"
+pr-watch "https://github.com/my-org/my-service/pull/456"
 ```
 
-### Faster polling (every 30 seconds)
+### Watch by PR number + repo
 
 ```bash
-python3 pr_watch.py --pr 456 --repo my-org/my-service --interval 30
+pr-watch --pr 456 --repo my-org/my-service
 ```
 
-### Squash merge instead of regular merge
+### Faster polling
 
 ```bash
-python3 pr_watch.py --pr 456 --repo my-org/my-service --merge-method squash
+pr-watch --pr 456 --repo my-org/my-service --interval 30
 ```
 
-### Only gate on specific CI checks
-
-Useful when a repo has many checks but only a few should block merge:
+### Force squash merge
 
 ```bash
-python3 pr_watch.py \
+pr-watch --pr 456 --repo my-org/my-service --merge-method squash
+```
+
+### Wait only on selected checks
+
+```bash
+pr-watch \
   --pr 456 \
   --repo my-org/my-service \
   --required-checks "build,unit-tests,sonar"
 ```
 
-Only checks whose names contain `build`, `unit-tests`, or `sonar` (case-insensitive substring match) are waited on.
-
-### Only stop on specific check failures
-
-Useful when optional checks fail but should not kill the watcher:
+### Stop only on selected failures
 
 ```bash
-python3 pr_watch.py \
+pr-watch \
   --pr 456 \
   --repo my-org/my-service \
   --stop-on-checks "sonar"
 ```
 
-### Dry run (safe testing)
-
-See what the script would do without changing anything:
+### Safe dry run
 
 ```bash
-python3 pr_watch.py --pr 456 --repo my-org/my-service --dry-run -v
+pr-watch --pr 456 --repo my-org/my-service --dry-run -v
 ```
 
-### Single approval repo
+### Sequential multi-PR run
 
 ```bash
-python3 pr_watch.py --pr 789 --repo my-org/my-lib --approvals 1
+pr-watch pr1 pr2 pr3
+```
+
+### Parallel multi-PR run
+
+```bash
+pr-watch --parallel pr1 pr2 pr3
 ```
 
 ---
 
 ## Running in the background
 
-### Foreground (simplest)
+### Foreground
 
-Leave the terminal open:
+Best for single PRs or for `--parallel` mode where you want the dashboard:
 
 ```bash
-python3 pr_watch.py --url "https://github.com/owner/repo/pull/123"
+pr-watch "https://github.com/owner/repo/pull/123"
 ```
 
-### `nohup` (close terminal safely)
+### `nohup`
 
 ```bash
-nohup python3 pr_watch.py \
-  --url "https://github.com/owner/repo/pull/123" \
+nohup pr-watch \
+  "https://github.com/owner/repo/pull/123" \
   >> ~/pr-watch.log 2>&1 &
 ```
 
@@ -367,41 +469,36 @@ Follow logs:
 tail -f ~/pr-watch.log
 ```
 
-Stop background process:
-
-```bash
-pgrep -fl pr_watch.py
-kill <pid>
-```
-
-### `tmux` (if installed)
+### `tmux`
 
 ```bash
 tmux new -s pr-watch
-python3 pr_watch.py --url "https://github.com/owner/repo/pull/123"
-# detach: Ctrl+B, then D
-# reattach: tmux attach -t pr-watch
+pr-watch --parallel pr1 pr2 pr3
+```
+
+Detach with `Ctrl+B`, then `D`.
+
+Reattach:
+
+```bash
+tmux attach -t pr-watch
 ```
 
 ---
 
-## Inspecting checks for your repo
+## Inspecting check names
 
-To find exact check names for `--required-checks` or `--stop-on-checks`:
+To find the exact checks to use with `--required-checks` or `--stop-on-checks`:
 
 ```bash
 gh pr checks 123 --repo owner/repo
 ```
 
-Example output:
+Then use partial names such as:
 
-```text
-SonarQube analysis    pass    2m
-CI / build            pass    4m
-lint                  skip    0m
+```bash
+pr-watch --pr 123 --repo owner/repo --required-checks "Sonar,Coverage"
 ```
-
-Then use substrings like `--stop-on-checks "Sonar"` or `--required-checks "build,lint"`.
 
 ---
 
@@ -409,25 +506,10 @@ Then use substrings like `--stop-on-checks "Sonar"` or `--required-checks "build
 
 On macOS the script uses `osascript`:
 
-- **Notifications** (non-blocking): merge success, update-branch triggered, manual stop
-- **Alerts** (blocking dialog): check failures, conflicts, PR closed
+- notifications for merge success, update-branch, and manual stop
+- alert dialogs for failed checks, conflicts, and PR closed
 
-On Linux and other platforms the script still runs; notifications are best-effort and may be no-ops depending on the environment.
-
----
-
-## Security
-
-- **No secrets in this repository**
-- Authentication is handled entirely by your local `gh` credential store
-- Anyone cloning this repo must authenticate with their own GitHub account
-- The script only acts on the PR you pass on the command line
-
-Do not commit:
-
-- log files from background runs
-- personal access tokens
-- `.env` files
+On Linux or other platforms, the watcher still runs even if desktop notifications are unavailable.
 
 ---
 
@@ -437,41 +519,50 @@ Do not commit:
 
 ```bash
 gh auth login -h github.com
-```
-
-### `gh command failed` / permission denied
-
-Ensure your account can merge the PR and that the token has `repo` scope:
-
-```bash
 gh auth refresh -s repo
 ```
 
-### Merge keeps retrying but never succeeds
+### `gh` is installed but not found
 
-Common causes:
+The script tries:
 
-- branch protection rules not satisfied (required reviewers, signed commits, etc.)
-- base branch moved again immediately before merge
-- checks still pending under a different name than you expect
+- `GH_BIN` environment variable
+- your current `PATH`
+- `/opt/homebrew/bin/gh`
 
-Run with `-v` and inspect:
+You can force a custom path like this:
+
+```bash
+GH_BIN=/custom/path/to/gh pr-watch "https://github.com/owner/repo/pull/123"
+```
+
+### Merge keeps retrying
+
+Common reasons:
+
+- branch protection rules are not fully satisfied
+- base branch moved again
+- another required check name is not included in your profile
+
+Inspect the raw PR state:
 
 ```bash
 gh pr view 123 --repo owner/repo --json state,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup
 ```
 
-### Script does not stop on a failed optional check
+### Update branch is not triggered
 
-Use `--stop-on-checks` to narrow which failures matter, or omit it to stop on any failed check.
+The watcher only attempts update when approvals are already satisfied and the PR is behind without conflicts.
 
-### Update branch not triggering
+### I wanted a merge commit, not squash
 
-The script waits until approvals are satisfied before updating. If the PR has conflicts, it stops with an alert — resolve them manually, push, then restart.
+The default is already:
 
-### Script squash-merged but I wanted a regular merge
+```text
+--merge-method merge
+```
 
-The default is now `merge` (regular merge commit). Older runs used `squash` by default. Pass `--merge-method merge` explicitly if needed.
+You only need to pass a different value if your repo prefers `squash` or `rebase`.
 
 ---
 
@@ -479,8 +570,8 @@ The default is now `merge` (regular merge commit). Older runs used `squash` by d
 
 | Code | Meaning |
 |------|---------|
-| `0` | merged successfully, or stopped via Ctrl+C |
-| `1` | check failure, conflicts, PR closed, or startup error |
+| `0` | merged successfully, already merged, or stopped via Ctrl+C |
+| `1` | check failure, merge conflicts, closed PR, or startup error |
 
 ---
 
@@ -489,12 +580,14 @@ The default is now `merge` (regular merge commit). Older runs used `squash` by d
 ```text
 pr-watch/
 ├── README.md
-├── .gitignore
-└── pr_watch.py
+├── install.sh
+├── pr-watch
+├── pr_watch.py
+└── repos.json
 ```
 
 ---
 
 ## License
 
-Use freely. No warranty — merge automation can race with other contributors and branch protection rules. Test with `--dry-run` first on important PRs.
+Use freely. No warranty. Always test with `--dry-run` first if you are using it on important PRs or new repos.

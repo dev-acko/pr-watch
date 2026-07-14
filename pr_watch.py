@@ -311,8 +311,11 @@ def classify_checks(
         name = check.get("name") or check.get("context") or "unknown-check"
         status = (check.get("status") or "").upper()
         conclusion = (check.get("conclusion") or "").upper()
+        completed_at = check.get("completedAt") or ""
+        if completed_at.startswith("0001-01-01"):
+            completed_at = ""
         sort_key = (
-            check.get("completedAt")
+            completed_at
             or check.get("startedAt")
             or check.get("createdAt")
             or ""
